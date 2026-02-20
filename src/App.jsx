@@ -5,17 +5,19 @@ import {
   Lock, WifiOff, Github
 } from 'lucide-react';
 
-// Core analysis logic (state independent)
-const performAnalysis = (sourceCode, configStr) => {
+// Core analysis logic (Multi-File Context enabled)
+const performAnalysis = (files, configStr) => {
   try {
-    let cleanedSol = sourceCode.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '').replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, '');
-    const pragmaMatch = cleanedSol.match(/pragma\s+solidity\s+([^;]+);/);
-    let activeVersion = pragmaMatch ? pragmaMatch[1].trim() : "Unknown";
+    const globalEntities = {};
+    const globalStructs = {};
+    const freeCodeByFile = {};
 
-    let framework = 'none';
+    let activeVersion = "Unknown";
     let isViaIrEnabled = null;
     let configVersion = null;
+    let framework = 'none';
 
+    // Parse config
     if (configStr && configStr.trim()) {
       const cleanedConfig = configStr.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '');
 
@@ -39,345 +41,354 @@ const performAnalysis = (sourceCode, configStr) => {
       }
     }
 
+    // Pass 1: Global Discovery (Build global registry from all files)
+    for (const fileObj of files) {
+      const filePath = fileObj.path;
+      const sourceCode = fileObj.content;
+
+      // Clean comments and strings
+      let cleanedSol = sourceCode.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '').replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, '');
+
+      if (activeVersion === "Unknown") {
+        const pragmaMatch = cleanedSol.match(/pragma\s+solidity\s+([^;]+);/);
+        if (pragmaMatch) activeVersion = pragmaMatch[1].trim();
+      }
+
+      // Extract structs
+      const structRegex = /struct\s+([a-zA-Z0-9_]+)\s*\{([^}]+)\}/g;
+      for (const match of cleanedSol.matchAll(structRegex)) {
+        const structName = match[1];
+        const structBody = match[2];
+        const members = {};
+        const statements = structBody.split(';');
+        for (const stmt of statements) {
+          const trimmed = stmt.trim();
+          if (!trimmed) continue;
+          const parts = trimmed.split(/\s+/);
+          if (parts.length >= 2) {
+            const varName = parts.pop();
+            const typeStr = parts.join('').replace(/\s+/g, '');
+            members[varName] = typeStr;
+          }
+        }
+        globalStructs[structName] = members;
+      }
+
+      // Extract entities (contracts, libraries, interfaces)
+      const regex = /(?:abstract\s+)?(contract|library|interface)\s+([a-zA-Z0-9_]+)(?:\s+is\s+([^{]+))?\s*\{/g;
+      let match;
+      let lastEnd = 0;
+      let freeCode = "";
+
+      while ((match = regex.exec(cleanedSol)) !== null) {
+        const type = match[1];
+        const name = match[2];
+        const bases = match[3] ? match[3].split(',').map(b => b.replace(/\s+/g, '').trim()).filter(Boolean) : [];
+
+        freeCode += cleanedSol.substring(lastEnd, match.index);
+
+        let braceCount = 1;
+        let i = match.index + match[0].length;
+        let bodyStart = i;
+        while (i < cleanedSol.length && braceCount > 0) {
+          if (cleanedSol[i] === '{') braceCount++;
+          else if (cleanedSol[i] === '}') braceCount--;
+          i++;
+        }
+        const body = cleanedSol.substring(bodyStart, i > bodyStart ? i - 1 : bodyStart);
+
+        if (!globalEntities[name]) globalEntities[name] = [];
+        globalEntities[name].push({ type, name, bases, body, filePath });
+
+        lastEnd = i;
+        regex.lastIndex = i; // Prevent infinite loops
+      }
+      freeCode += cleanedSol.substring(lastEnd);
+      freeCodeByFile[filePath] = freeCode;
+    }
+
     if (configVersion) activeVersion = configVersion;
 
     const isVulnerableVersion = /(0\.8\.(28|29|30|31|32|33))/.test(activeVersion) ||
       (/(\^0\.8\.(2[0-8]))/.test(activeVersion) && !configVersion);
 
-    // 1. Extract Global Struct Definitions
-    const structs = {};
-    const structRegex = /struct\s+([a-zA-Z0-9_]+)\s*\{([^}]+)\}/g;
-    for (const match of cleanedSol.matchAll(structRegex)) {
-      const structName = match[1];
-      const structBody = match[2];
+    // Recursive helper to build flattened body resolving bases from ANY file
+    function getFullBody(entityName, specificEntity = null, visited = new Set()) {
+      const cleanName = entityName.split('(')[0].split('.').pop().trim();
+      const visitKey = specificEntity ? specificEntity.filePath + ":" + specificEntity.name : cleanName;
 
-      const members = {};
-      const statements = structBody.split(';');
-      for (const stmt of statements) {
-        const trimmed = stmt.trim();
-        if (!trimmed) continue;
-        const parts = trimmed.split(/\s+/);
-        if (parts.length >= 2) {
-          const varName = parts.pop();
-          const typeStr = parts.join('').replace(/\s+/g, '');
-          members[varName] = typeStr;
+      if (visited.has(visitKey)) return "";
+      visited.add(visitKey);
+
+      let full = "";
+
+      if (specificEntity) {
+        full += specificEntity.body + "\n";
+        for (let baseName of specificEntity.bases) {
+          full += getFullBody(baseName, null, visited) + "\n";
         }
-      }
-      structs[structName] = members;
-    }
+      } else {
+        const entities = globalEntities[cleanName];
+        if (!entities) return "";
 
-    // 2. Extract Entities (Contracts/Libraries) & Free Code
-    function extractEntities(code) {
-      const entities = {};
-      const regex = /(?:abstract\s+)?(contract|library|interface)\s+([a-zA-Z0-9_]+)(?:\s+is\s+([^{]+))?\s*\{/g;
-      let match;
-      while ((match = regex.exec(code)) !== null) {
-        const type = match[1];
-        const name = match[2];
-        const bases = match[3] ? match[3].split(',').map(b => b.trim()) : [];
+        // Greedily append all entities matching the name to handle duplicates/mocks
+        for (const e of entities) {
+          const eKey = e.filePath + ":" + e.name;
+          if (visited.has(eKey)) continue;
+          visited.add(eKey);
 
-        let braceCount = 1;
-        let i = match.index + match[0].length;
-        let bodyStart = i;
-        while (i < code.length && braceCount > 0) {
-          if (code[i] === '{') braceCount++;
-          else if (code[i] === '}') braceCount--;
-          i++;
+          full += e.body + "\n";
+          for (let baseName of e.bases) {
+            full += getFullBody(baseName, null, visited) + "\n";
+          }
         }
-        const body = code.substring(bodyStart, i > bodyStart ? i - 1 : bodyStart);
-        entities[name] = { type, name, bases, body, start: match.index, end: i };
-      }
-
-      let lastEnd = 0;
-      let freeCode = "";
-      const sortedEntities = Object.values(entities).sort((a, b) => a.start - b.start);
-      for (const e of sortedEntities) {
-        freeCode += code.substring(lastEnd, e.start);
-        lastEnd = e.end;
-      }
-      freeCode += code.substring(lastEnd);
-
-      return { entities, freeCode };
-    }
-
-    const { entities, freeCode } = extractEntities(cleanedSol);
-
-    function getFullBody(entityName, visited = new Set()) {
-      if (visited.has(entityName)) return "";
-      visited.add(entityName);
-
-      const e = entities[entityName];
-      if (!e) return "";
-
-      let full = e.body + "\n";
-      for (const base of e.bases) {
-        const baseName = base.split('(')[0].trim();
-        full += getFullBody(baseName, visited) + "\n";
       }
       return full;
     }
 
-    const contractKeys = Object.keys(entities).filter(k => entities[k].type === 'contract');
-    const analysisBlocks = [];
+    const totalCollisions = [];
+    const allVarsInfo = [];
 
-    if (contractKeys.length === 0) {
-      analysisBlocks.push({ name: "Global Snippet", body: cleanedSol });
-    } else {
-      for (const cName of contractKeys) {
+    // Pass 2: Contextual Analysis per Physical Contract Entity
+    for (const [cName, entityList] of Object.entries(globalEntities)) {
+      for (const cEntity of entityList) {
+        if (cEntity.type !== 'contract') continue;
+
         let visited = new Set();
-        let fullBody = getFullBody(cName, visited);
-        // Free functions can be inlined into any contract, so merge them
-        let contractScopeBody = fullBody + "\n" + freeCode;
+        let fullBody = getFullBody(cName, cEntity, visited);
+        let contractScopeBody = fullBody + "\n" + (freeCodeByFile[cEntity.filePath] || "");
 
-        // [Case 1 Fix] When referencing a library, pull its code into the current contract context
+        // Recursively pull in libraries used from ANY file in the project
         let addedLibs;
         do {
           addedLibs = false;
-          for (const libName in entities) {
-            if (entities[libName].type === 'library' && !visited.has(libName)) {
-              const regex = new RegExp(`\\b${libName}\\b`);
-              if (regex.test(contractScopeBody)) {
-                contractScopeBody += "\n" + getFullBody(libName, visited);
+          for (const libName in globalEntities) {
+            if (globalEntities[libName][0].type === 'library' && !visited.has(libName)) {
+              const libRegex = new RegExp(`\\b${libName}\\b`);
+              if (libRegex.test(contractScopeBody)) {
+                contractScopeBody += "\n" + getFullBody(libName, null, visited);
                 addedLibs = true;
               }
             }
           }
         } while (addedLibs);
 
-        analysisBlocks.push({ name: cName, body: contractScopeBody });
-      }
-    }
+        let creationCode = "";
+        let runtimeCode = "";
 
-    const totalCollisions = [];
-    const allVarsInfo = [];
-
-    // 3. Separate scopes per contract and start isolated analysis
-    for (const block of analysisBlocks) {
-      const cName = block.name;
-      const contractScopeBody = block.body;
-
-      // [Case 2 Fix] Physical separation of Creation Code vs Runtime Code
-      let creationCode = "";
-      let runtimeCode = "";
-
-      // Extract runtime blocks (functions, modifiers, etc.) - the rest remains in the constructor area
-      const runtimeBlockRegex = /\b(?:function|modifier|fallback|receive)\b[^{]*\{/g;
-      let lastIdx = 0;
-      let match;
-      while ((match = runtimeBlockRegex.exec(contractScopeBody)) !== null) {
-        creationCode += contractScopeBody.substring(lastIdx, match.index);
-        let start = match.index;
-        let braceStart = start + match[0].length - 1;
-        let braceCount = 1;
-        let i = braceStart + 1;
-        while (i < contractScopeBody.length && braceCount > 0) {
-          if (contractScopeBody[i] === '{') braceCount++;
-          else if (contractScopeBody[i] === '}') braceCount--;
-          i++;
-        }
-        runtimeCode += contractScopeBody.substring(start, i) + "\n";
-        lastIdx = i;
-        runtimeBlockRegex.lastIndex = i;
-      }
-      creationCode += contractScopeBody.substring(lastIdx);
-
-      // Extract variable info (Variable declarations can be in the Creation area, so parse based on the entire body)
-      const allExprRegexes = [
-        /delete\s+([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)/g,
-        /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\.pop\s*\(\s*\)/g,
-        /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\s*=(?!=)[^;]+;/g
-      ];
-
-      const allRawMatches = [];
-      allExprRegexes.forEach(regex => {
-        for (const m of contractScopeBody.matchAll(regex)) {
-          allRawMatches.push(m[1].trim());
-        }
-      });
-
-      const rootVarsSet = new Set(allRawMatches.map(expr => {
-        const m = expr.match(/^([a-zA-Z0-9_]+)/);
-        return m ? m[1] : null;
-      }).filter(Boolean));
-
-      const varsInfo = {};
-
-      rootVarsSet.forEach(varName => {
-        // Improved to cover mapping parameters and various forms (allowing commas, closing parentheses)
-        const declRegex = new RegExp(
-          `(?:(mapping\\s*\\([^{};]+\\))|([a-zA-Z0-9_]+(?:\\s*\\[.*?\\])*))` +
-          `\\s+` +
-          `((?:(?:public|private|internal|transient|constant|immutable|memory|storage|calldata)\\s+)*)` +
-          `\\b${varName}\\b\\s*(?:=|;|,|\\))`
-        );
-
-        const declMatch = contractScopeBody.match(declRegex);
-        if (declMatch) {
-          varsInfo[varName] = {
-            type: (declMatch[1] || declMatch[2]).replace(/\s+/g, ''),
-            isTransient: (declMatch[3] || "").includes('transient'),
-          };
-          if (!allVarsInfo.some(v => v.name === varName && v.contract === cName)) {
-            allVarsInfo.push({ name: varName, contract: cName, isTransient: varsInfo[varName].isTransient });
+        // Scope Separation (Creation vs Runtime)
+        const runtimeBlockRegex = /\b(?:function|modifier|fallback|receive)\b[^{]*\{/g;
+        let lastIdx = 0;
+        let match;
+        while ((match = runtimeBlockRegex.exec(contractScopeBody)) !== null) {
+          creationCode += contractScopeBody.substring(lastIdx, match.index);
+          let start = match.index;
+          let braceStart = start + match[0].length - 1;
+          let braceCount = 1;
+          let i = braceStart + 1;
+          while (i < contractScopeBody.length && braceCount > 0) {
+            if (contractScopeBody[i] === '{') braceCount++;
+            else if (contractScopeBody[i] === '}') braceCount--;
+            i++;
           }
+          runtimeCode += contractScopeBody.substring(start, i) + "\n";
+          lastIdx = i;
+          runtimeBlockRegex.lastIndex = i;
         }
-      });
+        creationCode += contractScopeBody.substring(lastIdx);
 
-      // Function to inspect each separated scope independently
-      const checkScope = (scopeName, scopeCode) => {
-        const clearExprs = [];
+        const allExprRegexes = [
+          /delete\s+([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)/g,
+          /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\.pop\s*\(\s*\)/g,
+          /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\s*=(?!=)[^;]+;/g
+        ];
 
-        const deleteRegex = /delete\s+([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)/g;
-        for (const m of scopeCode.matchAll(deleteRegex)) {
-          clearExprs.push({ text: m[1].trim(), kind: 'delete' });
-        }
-        const popRegex = /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\.pop\s*\(\s*\)/g;
-        for (const m of scopeCode.matchAll(popRegex)) {
-          clearExprs.push({ text: m[1].trim(), kind: 'pop' });
-        }
-        const assignRegex = /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\s*=(?!=)[^;]+;/g;
-        for (const m of scopeCode.matchAll(assignRegex)) {
-          clearExprs.push({ text: m[1].trim(), kind: 'assign' });
-        }
+        const allRawMatches = [];
+        allExprRegexes.forEach(regex => {
+          for (const m of contractScopeBody.matchAll(regex)) {
+            allRawMatches.push(m[1].trim());
+          }
+        });
 
-        if (clearExprs.length === 0) return;
+        const rootVarsSet = new Set(allRawMatches.map(expr => {
+          const m = expr.match(/^([a-zA-Z0-9_]+)/);
+          return m ? m[1] : null;
+        }).filter(Boolean));
 
-        const expandedTypeMap = {};
-        const addExpandedType = (type, exprStr, isTransient) => {
-          if (!expandedTypeMap[type]) expandedTypeMap[type] = { transient: new Set(), persistent: new Set() };
-          if (isTransient) expandedTypeMap[type].transient.add(exprStr);
-          else expandedTypeMap[type].persistent.add(exprStr);
-        };
+        const varsInfo = {};
 
-        clearExprs.forEach(exprObj => {
-          const expr = exprObj.text;
-          const kind = exprObj.kind;
+        rootVarsSet.forEach(varName => {
+          const declRegex = new RegExp(
+            `(?:(mapping\\s*\\([^{};]+\\))|([a-zA-Z0-9_]+(?:\\s*\\[.*?\\])*))` +
+            `\\s+` +
+            `((?:(?:public|private|internal|transient|constant|immutable|memory|storage|calldata)\\s+)*)` +
+            `\\b${varName}\\b\\s*(?:=|;|,|\\))`
+          );
 
-          const rootMatch = expr.match(/^([a-zA-Z0-9_]+)/);
-          if (!rootMatch) return;
-          const rootVar = rootMatch[1];
-          const vInfo = varsInfo[rootVar];
-          if (!vInfo) return;
+          const declMatch = contractScopeBody.match(declRegex);
+          if (declMatch) {
+            varsInfo[varName] = {
+              type: (declMatch[1] || declMatch[2]).replace(/\s+/g, ''),
+              isTransient: (declMatch[3] || "").includes('transient'),
+            };
+            if (!allVarsInfo.some(v => v.name === varName && v.contract === cName)) {
+              allVarsInfo.push({ name: varName, contract: cName, isTransient: varsInfo[varName].isTransient });
+            }
+          }
+        });
 
-          let currentType = vInfo.type;
-          const isTransient = vInfo.isTransient;
+        const checkScope = (scopeName, scopeCode) => {
+          const clearExprs = [];
 
-          const accessRegex = /(?:\.([a-zA-Z0-9_]+))|(?:\[.*?\])/g;
-          let accMatch;
-          const accessStr = expr.substring(rootVar.length);
+          const deleteRegex = /delete\s+([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)/g;
+          for (const m of scopeCode.matchAll(deleteRegex)) {
+            clearExprs.push({ text: m[1].trim(), kind: 'delete' });
+          }
+          const popRegex = /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\.pop\s*\(\s*\)/g;
+          for (const m of scopeCode.matchAll(popRegex)) {
+            clearExprs.push({ text: m[1].trim(), kind: 'pop' });
+          }
+          const assignRegex = /([a-zA-Z0-9_]+(?:(?:\.[a-zA-Z0-9_]+)|(?:\[.*?\]))*)\s*=(?!=)[^;]+;/g;
+          for (const m of scopeCode.matchAll(assignRegex)) {
+            clearExprs.push({ text: m[1].trim(), kind: 'assign' });
+          }
 
-          // Progressive access type inference
-          while ((accMatch = accessRegex.exec(accessStr)) !== null) {
-            const access = accMatch[0];
-            if (access.startsWith('[')) {
-              if (currentType.endsWith(']')) {
-                const lastBracket = currentType.lastIndexOf('[');
-                currentType = currentType.substring(0, lastBracket);
-              } else if (currentType.includes('=>')) {
-                const arrowIdx = currentType.indexOf('=>');
-                const endParen = currentType.lastIndexOf(')');
-                if (arrowIdx !== -1) {
-                  currentType = endParen !== -1
-                    ? currentType.substring(arrowIdx + 2, endParen).trim()
-                    : currentType.substring(arrowIdx + 2).trim();
+          if (clearExprs.length === 0) return;
+
+          const expandedTypeMap = {};
+          const addExpandedType = (type, exprStr, isTransient) => {
+            if (!expandedTypeMap[type]) expandedTypeMap[type] = { transient: new Set(), persistent: new Set() };
+            if (isTransient) expandedTypeMap[type].transient.add(exprStr);
+            else expandedTypeMap[type].persistent.add(exprStr);
+          };
+
+          clearExprs.forEach(exprObj => {
+            const expr = exprObj.text;
+            const kind = exprObj.kind;
+
+            const rootMatch = expr.match(/^([a-zA-Z0-9_]+)/);
+            if (!rootMatch) return;
+            const rootVar = rootMatch[1];
+            const vInfo = varsInfo[rootVar];
+            if (!vInfo) return;
+
+            let currentType = vInfo.type;
+            const isTransient = vInfo.isTransient;
+
+            const accessRegex = /(?:\.([a-zA-Z0-9_]+))|(?:\[.*?\])/g;
+            let accMatch;
+            const accessStr = expr.substring(rootVar.length);
+
+            while ((accMatch = accessRegex.exec(accessStr)) !== null) {
+              const access = accMatch[0];
+              if (access.startsWith('[')) {
+                if (currentType.endsWith(']')) {
+                  const lastBracket = currentType.lastIndexOf('[');
+                  currentType = currentType.substring(0, lastBracket);
+                } else if (currentType.includes('=>')) {
+                  const arrowIdx = currentType.indexOf('=>');
+                  const endParen = currentType.lastIndexOf(')');
+                  if (arrowIdx !== -1) {
+                    currentType = endParen !== -1
+                      ? currentType.substring(arrowIdx + 2, endParen).trim()
+                      : currentType.substring(arrowIdx + 2).trim();
+                  }
+                }
+              } else if (access.startsWith('.')) {
+                const member = accMatch[1];
+                if (globalStructs[currentType] && globalStructs[currentType][member]) {
+                  currentType = globalStructs[currentType][member];
                 }
               }
-            } else if (access.startsWith('.')) {
-              const member = accMatch[1];
-              if (structs[currentType] && structs[currentType][member]) {
-                currentType = structs[currentType][member];
+            }
+
+            if (kind === 'assign') {
+              const baseTypesToClear = [];
+              const searchDynamicArrays = (t, visited) => {
+                if (visited.has(t)) return;
+                visited.add(t);
+                if (t.endsWith(']')) {
+                  const lastBracket = t.lastIndexOf('[');
+                  if (lastBracket > 0) baseTypesToClear.push(t.substring(0, lastBracket));
+                } else if (globalStructs[t]) {
+                  Object.values(globalStructs[t]).forEach(member => searchDynamicArrays(member, visited));
+                }
+              };
+              searchDynamicArrays(currentType, new Set());
+              if (baseTypesToClear.length === 0) return;
+
+              baseTypesToClear.forEach(t => {
+                addExpandedType(t, `${expr} = ... (Array Shrink)`, isTransient);
+              });
+              return;
+            } else if (kind === 'pop') {
+              if (currentType.endsWith(']')) {
+                const lastBracket = currentType.lastIndexOf('[');
+                if (lastBracket > 0) currentType = currentType.substring(0, lastBracket);
               }
             }
-          }
 
-          // [Case 2 Fix] Detect element clearing behavior due to array shrinking upon assignment
-          if (kind === 'assign') {
-            const baseTypesToClear = [];
-            const searchDynamicArrays = (t, visited) => {
-              if (visited.has(t)) return;
-              visited.add(t);
+            const visitedTypes = new Set();
+            const queue = [currentType];
+
+            while (queue.length > 0) {
+              let t = queue.shift();
+              t = t.replace(/\s+/g, '');
+              if (visitedTypes.has(t)) continue;
+              visitedTypes.add(t);
+
+              let displayExpr = expr;
+              if (kind === 'pop') displayExpr += '.pop()';
+              else displayExpr = 'delete ' + displayExpr;
+
+              addExpandedType(t, displayExpr, isTransient);
+
               if (t.endsWith(']')) {
+                if (!visitedTypes.has('uint256')) {
+                  queue.push('uint256');
+                }
                 const lastBracket = t.lastIndexOf('[');
-                if (lastBracket > 0) baseTypesToClear.push(t.substring(0, lastBracket));
-              } else if (structs[t]) {
-                Object.values(structs[t]).forEach(member => searchDynamicArrays(member, visited));
+                if (lastBracket > 0) {
+                  queue.push(t.substring(0, lastBracket));
+                }
               }
-            };
-            searchDynamicArrays(currentType, new Set());
-            if (baseTypesToClear.length === 0) return; // Ignore simple assignments that do not involve dynamic arrays
 
-            baseTypesToClear.forEach(t => {
-              addExpandedType(t, `${expr} = ... (Array Shrink)`, isTransient);
-            });
-            return; // Assignment processing is complete
-          } else if (kind === 'pop') {
-            if (currentType.endsWith(']')) {
-              const lastBracket = currentType.lastIndexOf('[');
-              if (lastBracket > 0) currentType = currentType.substring(0, lastBracket);
-            }
-          }
-
-          const visitedTypes = new Set();
-          const queue = [currentType];
-
-          while (queue.length > 0) {
-            let t = queue.shift();
-            t = t.replace(/\s+/g, '');
-            if (visitedTypes.has(t)) continue;
-            visitedTypes.add(t);
-
-            let displayExpr = expr;
-            if (kind === 'pop') displayExpr += '.pop()';
-            else displayExpr = 'delete ' + displayExpr;
-
-            addExpandedType(t, displayExpr, isTransient);
-
-            if (t.endsWith(']')) {
-              if (!visitedTypes.has('uint256')) {
-                queue.push('uint256');
+              if (globalStructs[t]) {
+                Object.values(globalStructs[t]).forEach(memberType => queue.push(memberType));
               }
-              const lastBracket = t.lastIndexOf('[');
-              if (lastBracket > 0) {
-                queue.push(t.substring(0, lastBracket));
+
+              if (t.includes('=>')) {
+                const arrowIdx = t.indexOf('=>');
+                const endParen = t.lastIndexOf(')');
+                if (arrowIdx !== -1) {
+                  queue.push(endParen !== -1
+                    ? t.substring(arrowIdx + 2, endParen).trim()
+                    : t.substring(arrowIdx + 2).trim());
+                }
               }
             }
+          });
 
-            if (structs[t]) {
-              Object.values(structs[t]).forEach(memberType => queue.push(memberType));
+          Object.keys(expandedTypeMap).forEach(type => {
+            const transVars = Array.from(expandedTypeMap[type].transient);
+            const persisVars = Array.from(expandedTypeMap[type].persistent);
+
+            if (transVars.length > 0 && persisVars.length > 0) {
+              totalCollisions.push({
+                contract: cName,
+                filePath: cEntity.filePath,
+                scope: scopeName,
+                type,
+                transientVars: transVars,
+                persistentVars: persisVars
+              });
             }
+          });
+        };
 
-            if (t.includes('=>')) {
-              const arrowIdx = t.indexOf('=>');
-              const endParen = t.lastIndexOf(')');
-              if (arrowIdx !== -1) {
-                queue.push(endParen !== -1
-                  ? t.substring(arrowIdx + 2, endParen).trim()
-                  : t.substring(arrowIdx + 2).trim());
-              }
-            }
-          }
-        });
-
-        Object.keys(expandedTypeMap).forEach(type => {
-          const transVars = Array.from(expandedTypeMap[type].transient);
-          const persisVars = Array.from(expandedTypeMap[type].persistent);
-
-          // Both must occur within the same scope (same Yul Object) for a collision to be established!
-          if (transVars.length > 0 && persisVars.length > 0) {
-            totalCollisions.push({
-              contract: cName,
-              scope: scopeName,
-              type,
-              transientVars: transVars,
-              persistentVars: persisVars
-            });
-          }
-        });
-      };
-
-      // Treat the two scopes as completely separate for analysis (Case 2 fix)
-      checkScope("Creation Code (Constructor/Init)", creationCode);
-      checkScope("Runtime Code (Functions)", runtimeCode);
+        checkScope("Creation Code (Constructor/Init)", creationCode);
+        checkScope("Runtime Code (Functions)", runtimeCode);
+      }
     }
 
     let status = 'SAFE';
@@ -408,7 +419,6 @@ const performAnalysis = (sourceCode, configStr) => {
 
 export default function App() {
   const [appMode, setAppMode] = useState('single');
-
   const [activeTab, setActiveTab] = useState('solidity');
 
   const [code, setCode] = useState(`// SPDX-License-Identifier: MIT
@@ -670,6 +680,7 @@ contract Case11_Workaround_AssignZero {
   }
 };
 export default config;`);
+
   const [singleResult, setSingleResult] = useState(null);
 
   const [projectFiles, setProjectFiles] = useState([]);
@@ -680,7 +691,7 @@ export default config;`);
 
   useEffect(() => {
     if (appMode === 'single') {
-      setSingleResult(performAnalysis(code, configCode));
+      setSingleResult(performAnalysis([{ path: 'single_test.sol', content: code }], configCode));
     }
   }, [code, configCode, appMode]);
 
@@ -688,17 +699,58 @@ export default config;`);
     e.preventDefault();
     setIsDragging(false);
 
-    const files = e.dataTransfer ? e.dataTransfer.files : e.target.files;
-    if (!files || files.length === 0) return;
+    let flatFiles = [];
+
+    // 1. Drag & Drop 처리 (FileSystem API를 이용한 재귀적 폴더 탐색)
+    if (e.dataTransfer && e.dataTransfer.items) {
+      const items = e.dataTransfer.items;
+
+      const readEntries = async (dirReader) => {
+        let entries = [];
+        let readResult;
+        do {
+          readResult = await new Promise(resolve => dirReader.readEntries(resolve));
+          entries = entries.concat(readResult);
+        } while (readResult.length > 0);
+        return entries;
+      };
+
+      const traverseFileTree = async (item, path = '') => {
+        if (item.isFile) {
+          const file = await new Promise(resolve => item.file(resolve));
+          // input[webkitdirectory] 와 동일한 방식으로 사용하기 위해 경로 주입
+          Object.defineProperty(file, 'customPath', { value: path + file.name });
+          flatFiles.push(file);
+        } else if (item.isDirectory) {
+          const dirReader = item.createReader();
+          const entries = await readEntries(dirReader);
+          for (let entry of entries) {
+            await traverseFileTree(entry, path + item.name + '/');
+          }
+        }
+      };
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i].webkitGetAsEntry();
+        if (item) await traverseFileTree(item);
+      }
+    }
+    // 2. Click (input file tag) 처리
+    else if (e.target.files) {
+      flatFiles = Array.from(e.target.files);
+    }
+
+    if (flatFiles.length === 0) return;
 
     let foundConfigContent = '';
     let foundConfigName = '';
     const tempSolFiles = [];
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      const path = file.webkitRelativePath || file.name;
+    for (let i = 0; i < flatFiles.length; i++) {
+      const file = flatFiles[i];
+      const path = file.customPath || file.webkitRelativePath || file.name;
 
+      // 무시할 디렉토리 패턴
       if (path.includes('node_modules/') || path.includes('lib/') || path.includes('test/')) continue;
 
       if (path.match(/foundry\.toml|hardhat\.config\.(ts|js)/)) {
@@ -712,10 +764,35 @@ export default config;`);
 
     setProjectConfig({ name: foundConfigName || 'No config file found', content: foundConfigContent });
 
-    const analyzedFiles = tempSolFiles.map(file => ({
-      ...file,
-      result: performAnalysis(file.content, foundConfigContent)
-    }));
+    // 1. Analyze entire project globally
+    const globalResult = performAnalysis(tempSolFiles, foundConfigContent);
+
+    // 2. Map global results back to individual files for UI
+    const analyzedFiles = tempSolFiles.map(file => {
+      // Extract collisions specific to this physical file
+      const fileCollisions = globalResult.collisions ? globalResult.collisions.filter(c => c.filePath === file.path) : [];
+
+      let fileStatus = 'SAFE';
+      let fileReason = 'No collision pattern causing the bug was found in this file.';
+
+      if (globalResult.status === 'ERROR') {
+        fileStatus = 'ERROR';
+        fileReason = globalResult.reason;
+      } else if (fileCollisions.length > 0) {
+        fileStatus = globalResult.status;
+        fileReason = globalResult.reason;
+      }
+
+      return {
+        ...file,
+        result: {
+          ...globalResult,
+          status: fileStatus,
+          reason: fileReason,
+          collisions: fileCollisions,
+        }
+      };
+    });
 
     analyzedFiles.sort((a, b) => {
       const score = { 'VULNERABLE': 3, 'WARNING': 2, 'SAFE': 1, 'ERROR': 0 };
@@ -796,7 +873,7 @@ export default config;`);
 
               <div>
                 <div className="text-sm font-medium text-slate-500 mb-3">Detected Collision Groups (Based on Scope Separation Analysis)</div>
-                {result.collisions.length > 0 ? (
+                {result.collisions && result.collisions.length > 0 ? (
                   <div className="space-y-3">
                     {result.collisions.map((col, idx) => (
                       <div key={idx} className="bg-red-50 border border-red-100 p-4 rounded-xl">
