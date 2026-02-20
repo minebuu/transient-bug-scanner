@@ -1,5 +1,9 @@
 # **🛡️ Transient Bug Scanner**
 
+**🌐 Try it Live: https://transient-bug-scanner.vercel.app/**
+
+<img width="1302" height="881" alt="image" src="https://github.com/user-attachments/assets/83257356-8fb5-4f3c-aee3-6ee07eee48c6" />
+
 A fast, 100% local, browser-based static analyzer for detecting the **Solidity Storage Clearing Collision Bug**.
 
 Source: https://www.soliditylang.org/blog/2026/02/18/transient-storage-clearing-helper-collision-bug
