@@ -2,6 +2,8 @@
 
 A fast, 100% local, browser-based static analyzer for detecting the **Solidity Storage Clearing Collision Bug**.
 
+Source: https://www.soliditylang.org/blog/2026/02/18/transient-storage-clearing-helper-collision-bug
+
 This tool checks whether your Solidity smart contracts are vulnerable to the transient storage clearing collision bug that occurs in compiler versions 0.8.28 through 0.8.33 when the IR pipeline (via-ir) is enabled.
 
 ## **✨ Features**
@@ -35,16 +37,20 @@ If you prefer to run the scanner on your local machine instead of the hosted web
 
 1. Clone this repository:
 
-git clone \[https://github.com/YOUR\_GITHUB\_ID/transient-bug-scanner.git\](https://github.com/YOUR\_GITHUB\_ID/transient-bug-scanner.git)  
+```
+git clone https://github.com/minebuu/transient-bug-scanner.git
 cd transient-bug-scanner
+```
 
 2. Install dependencies:
-
+```
 npm install
-
+```
 3. Start the development server:
 
+```
 npm run dev
+```
 
 4. Open http://localhost:5173 in your browser.
 
