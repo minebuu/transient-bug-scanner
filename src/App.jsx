@@ -750,8 +750,8 @@ export default config;`);
       const file = flatFiles[i];
       const path = file.customPath || file.webkitRelativePath || file.name;
 
-      // 무시할 디렉토리 패턴
-      if (path.includes('node_modules/') || path.includes('lib/') || path.includes('test/')) continue;
+      // 무시할 디렉토리 패턴 (lib 제외 처리 제거)
+      if (path.includes('node_modules/') || path.includes('test/')) continue;
 
       if (path.match(/foundry\.toml|hardhat\.config\.(ts|js)/)) {
         foundConfigContent = await file.text();
