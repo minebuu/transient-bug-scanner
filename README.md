@@ -35,16 +35,20 @@ If you prefer to run the scanner on your local machine instead of the hosted web
 
 1. Clone this repository:
 
-git clone \[https://github.com/YOUR\_GITHUB\_ID/transient-bug-scanner.git\](https://github.com/YOUR\_GITHUB\_ID/transient-bug-scanner.git)  
+```
+git clone https://github.com/minebuu/transient-bug-scanner
 cd transient-bug-scanner
+```
 
 2. Install dependencies:
-
+```
 npm install
-
+```
 3. Start the development server:
 
+```
 npm run dev
+```
 
 4. Open http://localhost:5173 in your browser.
 
