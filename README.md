@@ -46,16 +46,22 @@ If you prefer to run the web-based scanner on your local machine instead of the 
 
 1. Clone this repository:
 
-git clone \[https://github.com/minebuu/transient-bug-scanner.git\](https://github.com/minebuu/transient-bug-scanner.git)  
+```
+git clone https://github.com/minebuu/transient-bug-scanner.git
 cd transient-bug-scanner
+```
 
 2. Install dependencies:
 
+```
 npm install
+```
 
 3. Start the development server:
 
+```
 npm run dev
+```
 
 4. Open http://localhost:5173 in your browser.
 
@@ -71,17 +77,19 @@ If you prefer using the terminal, a standalone Node.js script (scanner.js) is in
 
 You can execute the script by passing a directory or a specific file path as an argument. If no argument is provided, it scans the current working directory.
 
-\# 1\. Make the script executable (Mac/Linux)  
+```
+// #1. Make the script executable (Mac/Linux)  
 chmod \+x scanner.js
 
-\# 2\. Scan the current directory  
+// #2. Scan the current directory  
 ./scanner.js
 
-\# 3\. Scan a specific project folder  
+// #3. Scan a specific project folder  
 ./scanner.js path/to/your/foundry-project
 
-\# 4\. Scan a single Solidity file  
+// #4. Scan a single Solidity file  
 ./scanner.js src/MyContract.sol
+```
 
 ## **🛠️ Built With**
 
