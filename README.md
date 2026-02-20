@@ -36,7 +36,7 @@ If you prefer to run the scanner on your local machine instead of the hosted web
 1. Clone this repository:
 
 ```
-git clone https://github.com/minebuu/transient-bug-scanner
+git clone https://github.com/minebuu/transient-bug-scanner.git
 cd transient-bug-scanner
 ```
 
