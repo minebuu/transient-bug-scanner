@@ -6,7 +6,7 @@
 
 A fast, 100% local, browser-based static analyzer for detecting the **Solidity Storage Clearing Collision Bug**.
 
-Source: https://www.soliditylang.org/blog/2026/02/18/transient-storage-clearing-helper-collision-bug
+Root cause of bug: https://www.soliditylang.org/blog/2026/02/18/transient-storage-clearing-helper-collision-bug
 
 This tool checks whether your Solidity smart contracts are vulnerable to the transient storage clearing collision bug that occurs in compiler versions 0.8.28 through 0.8.33 when the IR pipeline (via-ir) is enabled.
 
